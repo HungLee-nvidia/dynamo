@@ -3,7 +3,7 @@
 
 use dynamo_custom_policy_builtin::{DefaultWorkerSelector, DefaultWorkerSelectorControl};
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,8 +22,8 @@ use dynamo_kv_router::protocols::{
     WorkerWithDpRank, compute_block_hash_for_seq,
 };
 use dynamo_kv_router::scheduling::{
-    OverlapAnalysis, OverlapSignals, PolicyClassConfig, PolicyProfile, PolicyQueue, QueueSnapshot,
-    ScheduleMode, SchedulingContext, WorkerPlacement,
+    OverlapAnalysis, OverlapSignals, PolicyClassConfig, PolicyProfile, PolicyQueue,
+    QueueEntryHandle, QueueMetadata, QueueSnapshot, ScheduleMode, SchedulingContext,
 };
 use dynamo_kv_router::sequences::topology::WorkerDpRange;
 use dynamo_kv_router::services::selection::affinity::{
@@ -404,6 +404,9 @@ impl SyncReplayIndexer {
 
 struct PendingRequest {
     uuid: Uuid,
+    /// Virtual arrival time. The class due time and arrival order count from it, also when the
+    /// request first waited for its conversation's affinity binding.
+    arrival_ms: f64,
     token_seq: Option<Vec<SequenceHash>>,
     isl_tokens: usize,
     /// Tiered overlap scored by the configured router (G1 plus weighted G2 hits).
@@ -481,6 +484,8 @@ pub(crate) struct OfflineReplayRouter {
     slots: Arc<ActiveSequencesMultiWorker<ReplayNoopPublisher>>,
     selector: DefaultWorkerSelector,
     pending: PolicyQueue<PendingRequest>,
+    /// The queue entry of each pending request, so cancellation does not scan the queue.
+    pending_entries: BTreeMap<Uuid, QueueEntryHandle>,
     indexer: SyncReplayIndexer,
     prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
     decay_time_epoch: Instant,
@@ -811,6 +816,7 @@ impl OfflineReplayRouter {
             slots,
             selector,
             pending: PolicyQueue::new(&profile),
+            pending_entries: BTreeMap::new(),
             indexer,
             prefill_load_estimator,
             // This is only a base Instant for converting replay `now_ms` values into
@@ -958,8 +964,13 @@ impl OfflineReplayRouter {
     ) -> Result<RouterEffects> {
         self.apply_due_kv_events(now_ms)?;
         self.advance_affinity_clock(now_ms)?;
-        let mut pending =
-            self.build_pending_request(request, max_output_tokens, replay_hashes, session_id)?;
+        let mut pending = self.build_pending_request(
+            request,
+            max_output_tokens,
+            replay_hashes,
+            session_id,
+            now_ms,
+        )?;
         if !self.acquire_affinity(&mut pending)? {
             self.affinity_waiting.push_back(pending);
             return Ok(RouterEffects::default());
@@ -977,6 +988,11 @@ impl OfflineReplayRouter {
             .profile
             .resolve_class_index(pending.policy_class.as_deref());
         let class = self.profile.class(class_index);
+        // Replay requests carry no explicit deadline, so a class TTFT budget counts from the
+        // virtual arrival, as the live router counts it from ingress, also after an affinity
+        // wait. As there, an unrepresentable budget fails before either admission path
+        // reserves anything.
+        let class_due_at = class.slo_ttft_due_at(self.decay_now(pending.arrival_ms))?;
         let should_queue = class.queueing_enabled()
             && (self.pending.has_backlog(class_index)
                 || Self::request_workers_busy(
@@ -987,33 +1003,33 @@ impl OfflineReplayRouter {
                 ));
 
         if should_queue {
-            let snapshot = self.snapshot_for(&mut pending);
-            let placement = pending
-                .affinity_hold
-                .as_ref()
-                .and_then(Hold::target)
-                .and_then(|target| {
-                    target
-                        .dp_rank
-                        .map(|rank| WorkerWithDpRank::new(target.worker_id, rank))
-                })
-                .map_or(WorkerPlacement::Any, WorkerPlacement::Exact);
+            let uuid = pending.uuid;
+            anyhow::ensure!(
+                !self.pending_entries.contains_key(&uuid),
+                "request {uuid} is already queued"
+            );
+            let metadata = QueueMetadata {
+                class_index,
+                snapshot: self.snapshot_for(&mut pending),
+                due_at: None,
+                class_due_at,
+                arrival_offset_secs: pending.arrival_ms.max(0.0) / 1000.0,
+            };
             let priority_jump = pending.priority_jump;
             let strict_priority = pending.strict_priority;
-            self.pending
-                .enqueue(
-                    class_index,
+            let entry = self
+                .pending
+                .enqueue_with_due_at(
+                    metadata,
                     self.workers_with_configs
                         .len()
                         .saturating_mul(self.dp_size as usize),
-                    snapshot,
-                    now_ms.max(0.0) / 1000.0,
                     priority_jump,
                     strict_priority,
-                    placement,
                     pending,
                 )
                 .map_err(|(rejection, _)| anyhow::Error::new(rejection))?;
+            self.pending_entries.insert(uuid, entry);
             self.needs_drain |= self.affinity.is_some();
             return Ok(RouterEffects::default());
         }
@@ -1085,10 +1101,17 @@ impl OfflineReplayRouter {
 
     /// Cancel a request that has not yet been assigned to a worker.
     pub(crate) fn cancel_pending(&mut self, uuid: Uuid) -> bool {
-        let before = self.pending_count();
+        let waiting = self.affinity_waiting.len();
         self.affinity_waiting.retain(|request| request.uuid != uuid);
-        self.pending.retain(|request| request.uuid != uuid);
-        self.pending_count() != before
+        let removed = self
+            .pending_entries
+            .remove(&uuid)
+            .and_then(|entry| self.pending.remove(entry));
+        // A class keeps one order, so a cancelled head, such as one bound to a busy rank, can
+        // expose a successor that runs now. A cancellation gets no terminal event; the next clock
+        // advance drains it.
+        self.needs_drain |= removed.as_ref().is_some_and(|(_, was_head)| *was_head);
+        removed.is_some() || self.affinity_waiting.len() != waiting
     }
 
     pub(crate) fn pending_count(&self) -> usize {
@@ -1223,6 +1246,7 @@ impl OfflineReplayRouter {
         max_output_tokens: usize,
         replay_hashes: Option<ReplayRequestHashes>,
         session_id: Option<String>,
+        arrival_ms: f64,
     ) -> Result<PendingRequest> {
         let request = request_view.metadata();
         anyhow::ensure!(
@@ -1299,6 +1323,7 @@ impl OfflineReplayRouter {
 
         Ok(PendingRequest {
             uuid,
+            arrival_ms,
             token_seq,
             isl_tokens: input_length,
             overlap,
@@ -1419,7 +1444,6 @@ impl OfflineReplayRouter {
     fn drain_pending(&mut self, decay_now: Instant) -> Result<Vec<WorkerAdmission>> {
         self.needs_drain = false;
         let mut admissions = Vec::new();
-        self.pending.recheck_all_workers();
         loop {
             // Most completions find an empty queue, which never consults the
             // predicate, so only snapshot worker loads once one is needed.
@@ -1435,6 +1459,8 @@ impl OfflineReplayRouter {
             };
             let request = popped.into_payload();
             let uuid = request.uuid;
+            let indexed = self.pending_entries.remove(&uuid);
+            debug_assert!(indexed.is_some());
             let outcome = self.admit_request(request, decay_now)?;
             admissions.push(WorkerAdmission {
                 uuid,
@@ -1609,19 +1635,20 @@ mod tests {
         assert!(advance(&mut policy, 0.0).is_empty());
         // An idle unrelated worker cannot override a binding to a busy rank.
         assert_eq!(policy.router.pending_count(), 1);
-        let other = submit(&mut policy, 3, "b", 0.0);
-        let other = if other.is_empty() {
-            advance(&mut policy, 0.0)
-        } else {
-            policy.placements(other)
-        };
-        assert_eq!(other.len(), 1);
-        assert_ne!(other[0].scheduler_id, first.worker_idx);
-        commit(&mut policy, other[0].request_id, 0.0);
+        // The class keeps one order: an unbound request waits behind the bound head even
+        // though another worker is idle.
+        assert!(submit(&mut policy, 3, "b", 0.0).is_empty());
+        assert!(advance(&mut policy, 0.0).is_empty());
+        assert_eq!(policy.router.pending_count(), 2);
         let released = terminal(&mut policy, first.uuid, 10.0);
-        assert_eq!(released.len(), 1);
+        assert_eq!(released.len(), 2);
+        assert_eq!(released[0].request_id, Uuid::from_u128(2));
         assert_eq!(released[0].scheduler_id, first.worker_idx);
-        commit(&mut policy, released[0].request_id, 10.0);
+        assert_eq!(released[1].request_id, Uuid::from_u128(3));
+        assert_ne!(released[1].scheduler_id, first.worker_idx);
+        for placement in &released {
+            commit(&mut policy, placement.request_id, 10.0);
+        }
         terminal(&mut policy, released[0].request_id, 20.0);
         let key = policy
             .router
@@ -2074,11 +2101,16 @@ mod tests {
             prompt_token_source: ReplayPromptTokenSource::LengthOnlySynthetic,
         });
 
-        let error =
-            match router.build_pending_request(&request, request.max_output_tokens, None, None) {
-                Ok(_) => panic!("length-only request unexpectedly reached KV placement"),
-                Err(error) => error,
-            };
+        let error = match router.build_pending_request(
+            &request,
+            request.max_output_tokens,
+            None,
+            None,
+            0.0,
+        ) {
+            Ok(_) => panic!("length-only request unexpectedly reached KV placement"),
+            Err(error) => error,
+        };
         assert!(
             error
                 .to_string()
@@ -2132,6 +2164,7 @@ mod tests {
                 request.max_output_tokens,
                 None,
                 Some("session-a".to_string()),
+                0.0,
             )
             .unwrap();
         let scheduling_request = pending.scheduling_request(FxHashMap::default());
@@ -2173,6 +2206,7 @@ mod tests {
                 request.max_output_tokens,
                 Some(replay_hashes.clone()),
                 None,
+                0.0,
             )
             .unwrap();
 
@@ -2768,6 +2802,329 @@ policy_classes:
                 .collect::<Vec<_>>();
             assert_eq!(pending, expected);
         }
+    }
+
+    #[test]
+    fn edf_offline_queue_orders_by_virtual_class_due_time_without_priority_modifiers() {
+        let path = std::env::temp_dir().join(format!("dynamo-replay-edf-{}.yaml", Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            r#"
+policy_classes:
+  - name: standard
+    quantum: 64
+    slo_ttft_ms: 250
+    prefill_busy_threshold_frac: 0.5
+"#,
+        )
+        .unwrap();
+        let config = KvRouterConfig {
+            router_policy_config: Some(path.display().to_string()),
+            ..KvRouterConfig::default()
+        };
+        let mut router = OfflineReplayRouter::new(&queueing_args(), Some(config), None, 1).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(router.profile.class(0).queue_policy, RouterQueuePolicy::Edf);
+
+        router
+            .on_request_arrival(&request(1, 1), None, 0.0)
+            .unwrap();
+        for (uuid, priority, strict_priority, now_ms) in
+            [(2, 0, 0, 10.0), (3, 1_000_000, 9, 20.0), (4, 0, 0, 30.0)]
+        {
+            router
+                .on_request_arrival(
+                    &request_with_priorities(uuid, uuid as u32, 64, priority, strict_priority),
+                    None,
+                    now_ms,
+                )
+                .unwrap();
+        }
+
+        // Each due time counts from the virtual arrival, not from wall-clock enqueue time.
+        let mut due_at = router
+            .pending
+            .entries()
+            .map(|entry| (entry.payload().uuid.as_u128(), entry.due_at()))
+            .collect::<Vec<_>>();
+        due_at.sort_unstable_by_key(|(uuid, _)| *uuid);
+        assert_eq!(
+            due_at,
+            [10.0, 20.0, 30.0]
+                .into_iter()
+                .zip(2..)
+                .map(|(now_ms, uuid)| (
+                    uuid,
+                    Some(router.decay_now(now_ms) + Duration::from_millis(250))
+                ))
+                .collect::<Vec<_>>()
+        );
+        let pending = router
+            .debug_snapshot(30.0)
+            .pending
+            .into_iter()
+            .map(|request| request.uuid.as_u128())
+            .collect::<Vec<_>>();
+        assert_eq!(pending, [2, 3, 4]);
+
+        // A passed class budget neither rejects nor delays a queued request.
+        let admitted = router
+            .on_request_completed(Uuid::from_u128(1), 10_000.0)
+            .unwrap();
+        assert_eq!(admitted_uuids(admitted), [Uuid::from_u128(2)]);
+    }
+
+    #[test]
+    fn affinity_waiter_keeps_its_virtual_arrival_for_the_class_due_time() {
+        use super::KvRouterPlacement as Policy;
+        use aisimulate_core::replay::PlacementPolicy;
+        let path = std::env::temp_dir().join(format!(
+            "dynamo-replay-edf-affinity-{}.yaml",
+            Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+policy_classes:
+  - name: standard
+    quantum: 64
+    slo_ttft_ms: 250
+    prefill_busy_threshold_frac: 0.5
+"#,
+        )
+        .unwrap();
+        let config = KvRouterConfig {
+            router_policy_config: Some(path.display().to_string()),
+            ..KvRouterConfig::default()
+        };
+        let mut policy =
+            Policy::new_with_selector_seed(&queueing_args(), Some(config), None, 1, Some(0))
+                .unwrap()
+                .with_conversation_affinity(Some(Default::default()))
+                .unwrap();
+        std::fs::remove_file(path).unwrap();
+        let submit = |policy: &mut Policy, id, session: &str, now| {
+            policy
+                .router
+                .on_request_arrival_for_session(
+                    &request(id, id as u32),
+                    None,
+                    Some(session.into()),
+                    now,
+                )
+                .unwrap()
+                .admissions
+        };
+
+        // Session a's second request arrives at 10 ms and waits for the binding its first
+        // request is still dispatching; session b's request queues at 50 ms.
+        let first = submit(&mut policy, 1, "a", 0.0)[0];
+        assert!(submit(&mut policy, 2, "a", 10.0).is_empty());
+        assert_eq!(policy.router.affinity_waiting.len(), 1);
+        assert!(submit(&mut policy, 3, "b", 50.0).is_empty());
+        // The binding commits at 100 ms, and the waiter joins the queue then.
+        <Policy as PlacementPolicy<DirectRequest>>::dispatch_committed(
+            &mut policy,
+            first.uuid,
+            100.0,
+        )
+        .unwrap();
+        assert!(
+            <Policy as PlacementPolicy<DirectRequest>>::advance_clock(&mut policy, 100.0)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Both due times count from the virtual arrivals, not from when the waiter queued.
+        let mut due_at = policy
+            .router
+            .pending
+            .entries()
+            .map(|entry| (entry.payload().uuid.as_u128(), entry.due_at()))
+            .collect::<Vec<_>>();
+        due_at.sort_unstable_by_key(|(uuid, _)| *uuid);
+        assert_eq!(
+            due_at,
+            [(2, 10.0), (3, 50.0)]
+                .map(|(uuid, arrival_ms)| (
+                    uuid,
+                    Some(policy.router.decay_now(arrival_ms) + Duration::from_millis(250))
+                ))
+                .to_vec()
+        );
+        // So the waiter dispatches first, to its bound worker.
+        let admitted = policy
+            .router
+            .on_request_completed(first.uuid, 200.0)
+            .unwrap();
+        assert_eq!(admitted_uuids(admitted), [Uuid::from_u128(2)]);
+    }
+
+    #[test]
+    fn cancelling_a_blocked_bound_head_drains_its_successor_at_the_next_clock_advance() {
+        use super::KvRouterPlacement as Policy;
+        use aisimulate_core::replay::PlacementPolicy;
+        let mut policy = Policy::new_with_selector_seed(
+            &queueing_args(),
+            Some(queueing_router_config()),
+            None,
+            2,
+            Some(0),
+        )
+        .unwrap()
+        .with_conversation_affinity(Some(Default::default()))
+        .unwrap();
+        let submit = |policy: &mut Policy, id, session: &str| {
+            policy
+                .router
+                .on_request_arrival_for_session(
+                    &request(id, id as u32),
+                    None,
+                    Some(session.into()),
+                    0.0,
+                )
+                .unwrap()
+                .admissions
+        };
+        let advance = |policy: &mut Policy, now| {
+            <Policy as PlacementPolicy<DirectRequest>>::advance_clock(policy, now).unwrap()
+        };
+
+        let first = submit(&mut policy, 1, "a")[0];
+        <Policy as PlacementPolicy<DirectRequest>>::dispatch_committed(
+            &mut policy,
+            first.uuid,
+            0.0,
+        )
+        .unwrap();
+        // Session a's next request is bound to the busy worker and heads the class; session b's
+        // request waits behind it although the other worker is idle.
+        assert!(submit(&mut policy, 2, "a").is_empty());
+        assert!(submit(&mut policy, 3, "b").is_empty());
+        assert!(advance(&mut policy, 0.0).is_empty());
+        // A cancelled queued request gets no terminal event, so the next clock step drains.
+        assert!(<Policy as PlacementPolicy<DirectRequest>>::cancel_pending(
+            &mut policy,
+            Uuid::from_u128(2)
+        ));
+        let released = advance(&mut policy, 1.0);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].request_id, Uuid::from_u128(3));
+        assert_ne!(released[0].scheduler_id, first.worker_idx);
+    }
+
+    #[test]
+    fn offline_cancellation_removes_only_the_indexed_queued_request() {
+        let mut router =
+            OfflineReplayRouter::new(&queueing_args(), Some(queueing_router_config()), None, 1)
+                .unwrap();
+        router
+            .on_request_arrival(&request(1, 1), None, 0.0)
+            .unwrap();
+        for uuid in 2..=4 {
+            router
+                .on_request_arrival(&request(uuid, uuid as u32), None, uuid as f64)
+                .unwrap();
+        }
+        assert_eq!(router.pending_count(), 3);
+        assert!(
+            router
+                .on_request_arrival(&request(3, 3), None, 5.0)
+                .unwrap_err()
+                .to_string()
+                .contains("is already queued")
+        );
+
+        assert!(router.cancel_pending(Uuid::from_u128(3)));
+        assert!(!router.cancel_pending(Uuid::from_u128(3)));
+        assert_eq!(router.pending_count(), 2);
+        assert_eq!(router.pending_entries.len(), 2);
+
+        let admitted = router
+            .on_request_completed(Uuid::from_u128(1), 10.0)
+            .unwrap();
+        assert_eq!(admitted_uuids(admitted), [Uuid::from_u128(2)]);
+        // An admitted request is no longer pending, so cancelling it finds nothing.
+        assert!(!router.cancel_pending(Uuid::from_u128(2)));
+        let admitted = router
+            .on_request_completed(Uuid::from_u128(2), 20.0)
+            .unwrap();
+        assert_eq!(admitted_uuids(admitted), [Uuid::from_u128(4)]);
+        assert_eq!(router.pending_count(), 0);
+        assert!(router.pending_entries.is_empty());
+    }
+
+    #[test]
+    fn unrepresentable_class_budget_fails_before_offline_admission_or_queueing() {
+        // Size the budget and a late virtual arrival from the platform clock's range: the arrival
+        // fits but arrival plus budget does not, while both fit for an arrival at 0.
+        let start = tokio::time::Instant::now();
+        let mut range = Duration::ZERO;
+        let mut step = Duration::MAX;
+        while step > Duration::from_secs(1) {
+            match range
+                .checked_add(step)
+                .filter(|later| start.checked_add(*later).is_some())
+            {
+                Some(later) => range = later,
+                None => step /= 2,
+            }
+        }
+        let budget_ms = u64::try_from(range.as_millis() * 2 / 3).unwrap_or(u64::MAX);
+        let late_ms = range.as_millis() as f64 - budget_ms as f64 / 2.0;
+
+        let path =
+            std::env::temp_dir().join(format!("dynamo-replay-overflow-{}.yaml", Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            format!(
+                "policy_classes:\n  - name: unbounded\n    quantum: 64\n    slo_ttft_ms: {budget_ms}\n    prefill_busy_threshold_frac: 0.5\n"
+            ),
+        )
+        .unwrap();
+        let config = KvRouterConfig {
+            router_policy_config: Some(path.display().to_string()),
+            ..KvRouterConfig::default()
+        };
+        let mut router = OfflineReplayRouter::new(&queueing_args(), Some(config), None, 1).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let overflows = |result: anyhow::Result<super::RouterEffects>| {
+            result.err().is_some_and(|error| {
+                error
+                    .to_string()
+                    .contains("exceeds the monotonic clock range")
+            })
+        };
+
+        // An idle worker would admit directly; the error comes first and books nothing.
+        assert!(overflows(router.on_request_arrival(
+            &request(1, 1),
+            None,
+            late_ms
+        )));
+        assert_eq!(
+            router
+                .on_request_arrival(&request(1, 1), None, 0.0)
+                .unwrap()
+                .admissions
+                .len(),
+            1
+        );
+        // With the worker busy it would queue; the error again leaves nothing queued.
+        assert!(overflows(router.on_request_arrival(
+            &request(2, 2),
+            None,
+            late_ms
+        )));
+        assert_eq!(router.pending_count(), 0);
+        assert!(
+            router
+                .on_request_arrival(&request(2, 2), None, 1.0)
+                .unwrap()
+                .admissions
+                .is_empty()
+        );
+        assert_eq!(router.pending_count(), 1);
     }
 
     #[test]
