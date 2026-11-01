@@ -40,6 +40,22 @@ impl Continuation {
                 ));
             }
         }
+        // Bad words match across the delivered/new boundary; extra args may
+        // drive custom logits processors with their own state.
+        if sampling
+            .bad_words
+            .as_ref()
+            .is_some_and(|words| !words.is_empty())
+        {
+            return Err("`sampling_params.bad_words` matches across the retry boundary".into());
+        }
+        if sampling
+            .vllm_xargs
+            .as_ref()
+            .is_some_and(|args| !args.is_empty())
+        {
+            return Err("`sampling_params.vllm_xargs` may carry engine state".into());
+        }
         if request.kv_transfer_params.is_some() {
             return Err("`kv_transfer_params` binds the request to one KV transfer".into());
         }
@@ -108,6 +124,8 @@ mod tests {
             json!({"seed": 7}),
             json!({"frequency_penalty": 0.5}),
             json!({"presence_penalty": -0.5}),
+            json!({"bad_words": ["x"]}),
+            json!({"vllm_xargs": {"processor": 1}}),
         ] {
             assert!(continuation(sampling).is_err());
         }
