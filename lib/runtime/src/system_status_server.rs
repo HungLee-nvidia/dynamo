@@ -4,6 +4,9 @@
 // TODO: (DEP-635) this file should be renamed to system_http_server.rs
 //  it is being used not just for status, health, but others like loras management.
 
+mod engine_auth;
+#[cfg(test)]
+mod engine_auth_tests;
 #[cfg(test)]
 mod probe_tests;
 
@@ -136,6 +139,7 @@ pub struct SystemStatusState {
     last_scrape: Arc<tokio::sync::Mutex<LastScrape>>,
     // Discovery metadata (only for Kubernetes backend)
     discovery_metadata: Option<Arc<tokio::sync::RwLock<crate::discovery::DiscoveryMetadata>>>,
+    engine_control_auth: engine_auth::EngineControlAuth,
 }
 
 /// The most recent `/metrics` render and when it started collecting.
@@ -155,6 +159,7 @@ impl SystemStatusState {
             root_drt: drt,
             last_scrape: Arc::new(tokio::sync::Mutex::new(LastScrape::default())),
             discovery_metadata,
+            engine_control_auth: engine_auth::EngineControlAuth::from_env()?,
         })
     }
 
@@ -299,14 +304,21 @@ fn build_system_status_router(
                 let state = Arc::clone(&server_state);
                 move || metadata_handler(state)
             }),
-        )
+        );
+
+    let engine_routes = Router::new()
         .route(
             "/engine/{*path}",
             any({
                 let state = Arc::clone(&server_state);
                 move |path, method, body| engine_route_handler(state, path, method, body)
             }),
-        );
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            server_state.engine_control_auth.clone(),
+            engine_auth::authorize,
+        ));
+    app = app.merge(engine_routes);
 
     // Add LoRA routes only if DYN_LORA_ENABLED is set to true
     if lora_enabled {
