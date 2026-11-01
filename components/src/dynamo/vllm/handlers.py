@@ -109,6 +109,7 @@ from .engine_generate import (
     publish_engine_generate_capability,
 )
 from .engine_monitor import VllmEngineMonitor
+from .generation_policy import PASSTHROUGH_GENERATION_POLICY, GenerationPolicy
 from .lora_state import LoRAState
 from .multimodal_utils.custom_encoder import (
     AsyncVisionEncoder,
@@ -1268,6 +1269,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
     The concrete decode, prefill, and Omni handlers provide examples.
     """
 
+    generation_policy: GenerationPolicy = PASSTHROUGH_GENERATION_POLICY
     _benchmark_results: Optional[dict] = None
     _scale_ep_in_progress: bool = False
     # get_ep_capacity single-flight state; see the comment at its call site.
@@ -3519,6 +3521,11 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         emit_routed_experts=True,
     ):
         try:
+            observer = self.generation_policy.request_observer(
+                sampling_params,
+                prompt,
+                request_id,
+            )
             # Log LoRA usage for this generation (debug level to avoid log spam)
             self._log_with_lora_context(
                 "Starting token generation for request {request_id}{lora_info}",
@@ -3558,6 +3565,7 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
             engine_prompt_token_ids: Optional[list[int]] = None
             async for res in gen:
                 # res is vllm's RequestOutput
+                observer.observe(res)
                 if want_engine_data and engine_prompt_token_ids is None:
                     engine_prompt_token_ids = res.prompt_token_ids
                 if (
@@ -3753,6 +3761,8 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                         out["stop_reason"] = stop_reason
                     yield out
 
+            observer.finish()
+
         except EngineDeadError as e:
             logger.error(f"vLLM EngineDeadError: {e}")
             logger.warning("Initiating Dynamo Runtime shutdown.")
@@ -3797,6 +3807,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         ] = None
 
     async def generate(self, request, context):
+        await self.generation_policy.admit_generation()
         normalize_request_token_ids(request)
         settings = _backend_metadata_upload_settings(request)
         if settings is not None and "kind" in settings and self.use_vllm_tokenizer:
