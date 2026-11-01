@@ -89,6 +89,16 @@ class Config(DynamoRuntimeConfig, DynamoVllmConfig):
     def validate(self) -> None:
         DynamoRuntimeConfig.validate(self)
         DynamoVllmConfig.validate(self)
+        if self.enable_rl_weight_transfer:
+            if not self.enable_rl:
+                raise ValueError("--enable-rl-weight-transfer requires --enable-rl")
+            control_token = os.environ.get("DYN_SYSTEM_ENGINE_AUTH_TOKEN", "")
+            if len(control_token) < 32 or any(
+                not ("!" <= character <= "~") for character in control_token
+            ):
+                raise ValueError(
+                    "strict RL weight transfer requires DYN_SYSTEM_ENGINE_AUTH_TOKEN with at least 32 ASCII graphic characters"
+                )
 
 
 @register_encoder(Config)
@@ -216,10 +226,54 @@ def configure_rl_logprobs_mode(config: Config) -> None:
         )
 
 
+def configure_rl_weight_transfer_worker(
+    config: Config, engine_config: AsyncEngineArgs
+) -> None:
+    """Install standalone device discovery only when no user extension was set."""
+    if (
+        config.enable_rl_weight_transfer is True
+        and not engine_config.worker_extension_cls
+    ):
+        engine_config.worker_extension_cls = (
+            "dynamo.vllm.weight_transfer_worker.StrictRLWorkerExtension"
+        )
+
+
 def cross_validate_config(
     dynamo_config: Config, engine_config: AsyncEngineArgs
 ) -> None:
     """Validate dynamo and engine config together. This should not modify the configs."""
+
+    if dynamo_config.enable_rl_weight_transfer:
+        if dynamo_config.disaggregation_mode != DisaggregationMode.AGGREGATED:
+            raise ValueError("strict RL weight transfer requires aggregated serving")
+        if any(
+            size != 1
+            for size in (
+                engine_config.tensor_parallel_size,
+                engine_config.data_parallel_size,
+                engine_config.pipeline_parallel_size,
+            )
+        ):
+            raise ValueError("strict RL weight transfer requires TP=DP=PP=1")
+        if engine_config.enable_lora or engine_config.speculative_config is not None:
+            raise ValueError(
+                "strict RL weight transfer does not support LoRA or speculative decoding"
+            )
+        if (
+            engine_config.weight_transfer_config is None
+            or engine_config.weight_transfer_config.backend not in ("ipc", "nccl")
+        ):
+            raise ValueError(
+                "strict RL weight transfer requires an explicit ipc or nccl weight-transfer backend"
+            )
+        if (
+            engine_config.generation_config != "vllm"
+            or engine_config.override_generation_config
+        ):
+            raise ValueError(
+                "strict RL weight transfer requires --generation-config=vllm and no sampling overrides"
+            )
 
     if hasattr(engine_config, "stream_interval") and engine_config.stream_interval != 1:
         logger.info(
@@ -356,6 +410,7 @@ def update_engine_config_with_dynamo(
     engine_config: AsyncEngineArgs,
 ) -> None:
     """Update engine config based on Dynamo config."""
+    configure_rl_weight_transfer_worker(dynamo_config, engine_config)
     if engine_config.enable_prefix_caching is None:
         if dynamo_config.embedding_worker or dynamo_config.classify_worker:
             # Pooling engines never decode, so prefix caching buys nothing —
