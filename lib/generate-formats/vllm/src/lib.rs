@@ -13,6 +13,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use dynamo_runtime::error::DynamoError;
 use serde_json::{Value, json};
 
+use crate::generate::migrate::Continuation;
 use crate::generate::{GenerateAggregator, GenerateRequest, GenerateResponseOptions};
 use dynamo_llm::generate_format::{
     Bound, ClientError, ClientRequest, GenerateExchange, GenerateFormat, Opened, Worker,
@@ -510,6 +511,7 @@ impl GenerateFormat for VllmFormat {
             validation,
             bind: Box::new(move |worker| {
                 let options = request.response_options();
+                let continuation = Continuation::new(&request);
                 let request = preprocessed_from_generate(
                     request,
                     worker.model,
@@ -520,10 +522,12 @@ impl GenerateFormat for VllmFormat {
                 .map_err(|error| ClientError::new(error.to_string()))?;
                 Ok(Bound {
                     request,
-                    migration: Err("vLLM generate requests do not migrate yet".to_string()),
+                    migration: continuation.as_ref().map(|_| ()).map_err(Clone::clone),
                     exchange: Box::new(VllmExchange {
                         aggregator: GenerateAggregator::new(request_id),
                         options,
+                        continuation,
+                        delivered: 0,
                     }),
                 })
             }),
@@ -538,6 +542,9 @@ impl GenerateFormat for VllmFormat {
 struct VllmExchange {
     aggregator: GenerateAggregator,
     options: GenerateResponseOptions,
+    continuation: Result<Continuation, String>,
+    /// Generated tokens seen across attempts.
+    delivered: usize,
 }
 
 impl GenerateExchange for VllmExchange {
@@ -547,6 +554,7 @@ impl GenerateExchange for VllmExchange {
         _prefill: bool,
         _emit: &mut dyn FnMut(&Value),
     ) -> Result<(), DynamoError> {
+        self.delivered += output.token_ids.len();
         self.aggregator
             .apply_output(output, self.options)
             .map_err(|error| DynamoError::from(error.as_ref()))
@@ -554,10 +562,24 @@ impl GenerateExchange for VllmExchange {
 
     fn migrate(
         &mut self,
-        _delivered_tokens: usize,
-        _request: &mut PreprocessedRequest,
+        delivered_tokens: usize,
+        request: &mut PreprocessedRequest,
     ) -> Result<Option<LLMEngineOutput>, String> {
-        Err("vLLM generate requests do not migrate yet".to_string())
+        let continuation = self.continuation.as_ref().map_err(Clone::clone)?;
+        if delivered_tokens != self.delivered {
+            return Err(format!(
+                "Dynamo delivered {delivered_tokens} tokens but vLLM reported {}",
+                self.delivered
+            ));
+        }
+        if self.aggregator.has_sampling_mask() {
+            return Err("a sampling mask covers only the failed attempt".to_string());
+        }
+        let prompt_delivered = self.aggregator.prompt_logprobs_delivered();
+        if self.options.include_prompt_logprobs && delivered_tokens > 0 && !prompt_delivered {
+            return Err("prompt logprobs were not delivered before output".to_string());
+        }
+        Ok(continuation.retry(delivered_tokens, prompt_delivered, request))
     }
 
     fn finish(&mut self) -> Result<Option<Value>, DynamoError> {

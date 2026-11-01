@@ -367,7 +367,7 @@ pub struct GenerateResponse {
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct GenerateResponseOptions {
     include_logprobs: bool,
-    include_prompt_logprobs: bool,
+    pub(crate) include_prompt_logprobs: bool,
 }
 
 /// Per-index accumulation state while folding a stream of
@@ -553,6 +553,17 @@ impl GenerateAggregator {
         }
     }
 
+    pub(crate) fn prompt_logprobs_delivered(&self) -> bool {
+        self.prompt_logprobs.is_some()
+    }
+
+    /// Sampling masks cover a single attempt's tokens.
+    pub(crate) fn has_sampling_mask(&self) -> bool {
+        self.choices
+            .values()
+            .any(|choice| choice.sampling_mask.is_some())
+    }
+
     pub(crate) fn apply_output(
         &mut self,
         mut output: LLMEngineOutput,
@@ -644,6 +655,8 @@ impl GenerateAggregator {
         })
     }
 }
+
+pub(crate) mod migrate;
 
 #[cfg(test)]
 mod tests;
