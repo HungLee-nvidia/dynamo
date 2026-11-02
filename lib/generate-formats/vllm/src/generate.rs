@@ -538,6 +538,9 @@ pub(crate) struct GenerateAggregator {
     request_id: String,
     choices: HashMap<u32, GenerateChoiceAcc>,
     prompt_logprobs: Option<PromptLogprobs>,
+    /// Trailing prompt positions to drop: a retry's prompt ends with the
+    /// tokens already delivered as output.
+    retry_prompt_suffix: usize,
     kv_transfer_params: Option<Value>,
     kv_transfer_params_from_engine_data: bool,
 }
@@ -548,6 +551,7 @@ impl GenerateAggregator {
             request_id,
             choices: HashMap::new(),
             prompt_logprobs: None,
+            retry_prompt_suffix: 0,
             kv_transfer_params: None,
             kv_transfer_params_from_engine_data: false,
         }
@@ -555,6 +559,12 @@ impl GenerateAggregator {
 
     pub(crate) fn prompt_logprobs_delivered(&self) -> bool {
         self.prompt_logprobs.is_some()
+    }
+
+    /// The next attempt's prompt ends with `delivered` output tokens; keep
+    /// only the original prompt's logprobs from it.
+    pub(crate) fn retry_after(&mut self, delivered: usize) {
+        self.retry_prompt_suffix = delivered;
     }
 
     /// Sampling masks cover a single attempt's tokens.
@@ -578,7 +588,16 @@ impl GenerateAggregator {
             && self.prompt_logprobs.is_none()
             && let Some(prompt_logprobs) = engine_data.remove("prompt_logprobs")
         {
-            self.prompt_logprobs = Some(parse_prompt_logprobs(prompt_logprobs)?);
+            let mut prompt_logprobs = parse_prompt_logprobs(prompt_logprobs)?;
+            let Some(len) = prompt_logprobs.len().checked_sub(self.retry_prompt_suffix) else {
+                anyhow::bail!(
+                    "retry returned {} prompt logprobs for {} delivered tokens",
+                    prompt_logprobs.len(),
+                    self.retry_prompt_suffix
+                );
+            };
+            prompt_logprobs.truncate(len);
+            self.prompt_logprobs = Some(prompt_logprobs);
         }
         if !self.kv_transfer_params_from_engine_data
             && output.finish_reason.is_some()
@@ -625,6 +644,7 @@ impl GenerateAggregator {
             prompt_logprobs,
             kv_transfer_params,
             kv_transfer_params_from_engine_data: _,
+            retry_prompt_suffix: _,
         } = self;
 
         let mut choices: Vec<GenerateResponseChoice> = choices

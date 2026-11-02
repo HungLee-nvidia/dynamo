@@ -273,14 +273,24 @@ impl AsyncEngine<Input, Output, Error> for FlakyVllmWorker {
         let sampling = &request.extra_args.as_ref().unwrap()["vllm_tito"]["sampling_params"];
         assert_eq!(sampling["max_tokens"], budget);
         let tokens = &VLLM_OUTPUT[delivered..(delivered + budget).min(VLLM_OUTPUT.len())];
+        // Like the vLLM worker, prompt logprobs ride on the final chunk.
+        let prompt_logprobs = request.output_options.prompt_logprobs.map(|_| {
+            let mut entries = vec![Value::Null];
+            entries.extend(request.token_ids[1..].iter().enumerate().map(|(i, token)| {
+                serde_json::json!({ token.to_string(): {"logprob": -(i as f32) - 1.0} })
+            }));
+            serde_json::json!({ "prompt_logprobs": entries })
+        });
         let mut items: Vec<_> = tokens
             .iter()
             .enumerate()
             .map(|(i, &token)| {
+                let last = i + 1 == tokens.len();
                 Annotated::from_data(LLMEngineOutput {
                     token_ids: vec![token],
-                    finish_reason: (i + 1 == tokens.len())
+                    finish_reason: last
                         .then_some(dynamo_llm::protocols::common::FinishReason::Length),
+                    engine_data: prompt_logprobs.clone().filter(|_| last),
                     ..Default::default()
                 })
             })
@@ -349,6 +359,15 @@ async fn a_vllm_request_migrated_mid_generation_returns_what_an_unbroken_one_doe
     let (status, migrated, calls) = respond(2, budget).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(calls, 3, "two failed attempts, then one that finishes");
+    assert_eq!(migrated, unbroken);
+    // Prompt logprobs arrive only with the final chunk, so the retry recomputes
+    // them over a longer prompt and the client sees the original prompt's.
+    let prompt = serde_json::json!({"max_tokens": 5, "prompt_logprobs": 1});
+    let (status, unbroken, _) = respond(0, prompt.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(unbroken["prompt_logprobs"].as_array().unwrap().len(), 3);
+    let (status, migrated, calls) = respond(2, prompt).await;
+    assert_eq!((status, calls), (StatusCode::OK, 3));
     assert_eq!(migrated, unbroken);
     // A seeded request cannot be continued with the same RNG state.
     let (status, _, calls) = respond(1, serde_json::json!({"max_tokens": 5, "seed": 7})).await;

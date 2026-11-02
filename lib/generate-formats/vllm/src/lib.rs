@@ -576,8 +576,8 @@ impl GenerateExchange for VllmExchange {
             return Err("a sampling mask covers only the failed attempt".to_string());
         }
         let prompt_delivered = self.aggregator.prompt_logprobs_delivered();
-        if self.options.include_prompt_logprobs && delivered_tokens > 0 && !prompt_delivered {
-            return Err("prompt logprobs were not delivered before output".to_string());
+        if !prompt_delivered {
+            self.aggregator.retry_after(delivered_tokens);
         }
         Ok(continuation.retry(delivered_tokens, prompt_delivered, request))
     }
